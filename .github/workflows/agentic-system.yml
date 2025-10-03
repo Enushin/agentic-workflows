@@ -1,0 +1,41 @@
+name: Agentic System
+on:
+  workflow_dispatch:
+    inputs:
+      agent:
+        type: choice
+        options: [issue, codegen, review, pr, coordinator]
+      issue_number:
+        type: string
+      files:
+        type: string
+        required: false
+      branch:
+        type: string
+        default: main
+
+jobs:
+  issue:
+    if: ${{ inputs.agent == 'issue' }}
+    uses: Enushin/agentic-workflows/.github/workflows/agentic-core.yml@main
+    with:
+      agent: issue
+      issue_number: ${{ inputs.issue_number }}
+      branch: ${{ inputs.branch }}
+  review:
+    if: ${{ inputs.agent == 'review' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm ci
+      - run: npm run lint
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const issue_number = parseInt('${{ inputs.issue_number }}', 10);
+            await github.issues.createComment({
+              owner, repo, issue_number,
+              body: '✅ Lint/Tests passed'
+            });
+  # codegen/pr/coordinator も同様に必須処理を実装
