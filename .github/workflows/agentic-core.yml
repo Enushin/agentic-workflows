@@ -1,4 +1,4 @@
-# Enushin/agentic-workflows/.github/workflows/agentic-core.yml
+# .github/workflows/agentic-core.yml
 name: Agentic Core
 on:
   workflow_call:
