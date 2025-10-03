@@ -8,7 +8,7 @@ on:
       files:        { required: false, type: string }
       branch:       { required: false, type: string, default: 'main' }
     secrets:
-      ANTHROPIC_API_KEY: { required: false }  # 使う時だけ
+      ANTHROPIC_API_KEY: { required: false }
 
 permissions:
   contents: write
@@ -20,40 +20,277 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with: { ref: ${{ inputs.branch }} }
+        with:
+          ref: ${{ inputs.branch }}
 
-      # --- agent ごとの分岐（stub） ---
-      - name: Issue analyze (stub)
+      - name: Setup Node (shared)
+        if: ${{ inputs.agent != 'issue' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      # ── Issue Agent ─────────────────────────────────────────────────────
+      - name: Issue intake & labeling
         if: ${{ inputs.agent == 'issue' }}
+        id: issue_labels
         uses: actions/github-script@v7
         with:
           script: |
-            const {owner, repo} = context.repo;
-            const n = parseInt("${{ inputs.issue_number }}", 10);
-            await github.issues.addLabels({ owner, repo, issue_number: n, labels: ['ai:triaged'] });
+            const { owner, repo } = context.repo;
+            const issueNumber = parseInt('${{ inputs.issue_number }}', 10);
 
-      - name: Codegen (stub)
+            const issue = await github.issues.get({ owner, repo, issue_number: issueNumber });
+            const body = issue.data.body || '';
+
+            const sections = {};
+            const regex = /^#\s+(.+?)\s*\n([\s\S]*?)(?=^#\s+|\Z)/gm;
+            let match;
+            while ((match = regex.exec(body)) !== null) {
+              sections[match[1].trim()] = match[2].trim();
+            }
+
+            const priorityMatch = body.match(/➡️P[0-3]-[^\s]+/);
+            const priorityLabel = priorityMatch ? priorityMatch[0] : '➡️P2-中';
+            const statusLabel = '00.未着手';
+
+            const authorityMatch = body.match(/🔴|🔵|🟡/);
+            const authorityIcon = authorityMatch ? authorityMatch[0] : '🔵';
+
+            await github.issues.addLabels({
+              owner,
+              repo,
+              issue_number: issueNumber,
+              labels: [statusLabel, priorityLabel]
+            });
+
+            const summary = [
+              `TL;DR: ${(sections['TL;DR（日本語）'] || '').split('\n')[0]}`,
+              `優先度: ${priorityLabel}`,
+              `権限レベル: ${authorityIcon}`,
+            ].join('\n');
+
+            await github.issues.createComment({
+              owner,
+              repo,
+              issue_number: issueNumber,
+              body: [
+                '## ✅ IssueAgent 自動処理結果',
+                '',
+                summary,
+                '',
+                '不足項目がある場合はテンプレートを追記してください。'
+              ].join('\n')
+            });
+
+      # ── Coordinator Agent ────────────────────────────────────────────────
+      - name: Coordinator plan
+        if: ${{ inputs.agent == 'coordinator' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const issueNumber = parseInt('${{ inputs.issue_number }}', 10);
+            const dag = [
+              '- PRD/ARCH整備',
+              '- 実装（コード・テスト）',
+              '- レビュー＆修正',
+              '- PR作成・QA',
+            ].join('\n');
+
+            await github.issues.addLabels({
+              owner,
+              repo,
+              issue_number: issueNumber,
+              labels: ['01.進行中']
+            });
+
+            await github.issues.createComment({
+              owner,
+              repo,
+              issue_number: issueNumber,
+              body: [
+                '## 🧭 CoordinatorAgent プラン',
+                '',
+                dag,
+                '',
+                '※ 必要に応じて DAG を編集して共有してください。'
+              ].join('\n')
+            });
+
+      # ── CodeGen Agent ────────────────────────────────────────────────────
+      - name: Install dependencies
         if: ${{ inputs.agent == 'codegen' }}
+        run: npm ci
+
+      - name: Run code generation
+        if: ${{ inputs.agent == 'codegen' }}
+        run: npm run agentic:codegen -- --issue ${{ inputs.issue_number }}
+
+      - name: Summarize codegen output
+        if: ${{ inputs.agent == 'codegen' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const issueNumber = parseInt('${{ inputs.issue_number }}', 10);
+
+            await github.issues.addLabels({
+              owner,
+              repo,
+              issue_number: issueNumber,
+              labels: ['02.レビュー中']
+            });
+
+            await github.issues.createComment({
+              owner,
+              repo,
+              issue_number: issueNumber,
+              body: [
+                '## 🤖 CodeGenAgent 実行結果',
+                '',
+                '- 生成物をコミット／チェックしてください。',
+                '- 追加調整が必要な場合はコメントを残します。',
+              ].join('\n')
+            });
+
+      # ── Review Agent ─────────────────────────────────────────────────────
+      - name: Install dependencies (review)
+        if: ${{ inputs.agent == 'review' }}
+        run: npm ci
+
+      - name: Run lint
+        if: ${{ inputs.agent == 'review' }}
+        id: lint
+        continue-on-error: true
+        run: npm run lint
+
+      - name: Run tests
+        if: ${{ inputs.agent == 'review' }}
+        id: tests
+        continue-on-error: true
+        run: npm test -- --watch=false
+
+      - name: Compute quality score
+        if: ${{ inputs.agent == 'review' }}
+        id: quality
         run: |
-          set -e
-          BRANCH="feat/issue-${{ inputs.issue_number }}-${GITHUB_RUN_ID}"
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -b "$BRANCH"
-          echo "# Auto scaffold for issue #${{ inputs.issue_number }}" > ai_${{ inputs.issue_number }}.md
-          git add . && git commit -m "feat: scaffold for issue #${{ inputs.issue_number }}" && git push -u origin "$BRANCH"
+          lint_outcome="${{ steps.lint.outcome }}"
+          test_outcome="${{ steps.tests.outcome }}"
+          score=100
+          if [ "$lint_outcome" != "success" ]; then score=$((score-50)); fi
+          if [ "$test_outcome" != "success" ]; then score=$((score-50)); fi
+          echo "score=$score" >> "$GITHUB_OUTPUT"
 
-      - name: Open draft PR (stub)
-        if: ${{ inputs.agent == 'codegen' }}
+      - name: Post review result
+        if: ${{ inputs.agent == 'review' }}
         uses: actions/github-script@v7
         with:
           script: |
-            const {owner, repo} = context.repo;
-            await github.pulls.create({
-              owner, repo,
-              head: `feat/issue-${{ inputs.issue_number }}-${process.env.GITHUB_RUN_ID}`,
-              base: '${{ inputs.branch || 'main' }}',
-              title: `feat: implement Issue #${{ inputs.issue_number }}`,
-              body: 'Draft PR (stub)',
-              draft: true
-            })
+            const { owner, repo } = context.repo;
+            const issueNumber = parseInt('${{ inputs.issue_number }}', 10);
+            const score = Number('${{ steps.quality.outputs.score }}');
+            const lintOK = '${{ steps.lint.outcome }}' === 'success';
+            const testOK = '${{ steps.tests.outcome }}' === 'success';
+
+            const passed = score >= 80;
+            const statusLabel = passed ? '04.テスト中' : '03.レビュー中';
+
+            await github.issues.addLabels({
+              owner,
+              repo,
+              issue_number: issueNumber,
+              labels: [statusLabel]
+            });
+
+            const commentLines = [
+              '## 🛡 ReviewAgent 評価',
+              '',
+              `quality_score: ${score}`,
+              `Lint: ${lintOK ? 'PASS' : 'FAIL'}`,
+              `Tests: ${testOK ? 'PASS' : 'FAIL'}`,
+              ''
+            ];
+
+            if (passed) {
+              commentLines.push('✅ 受け入れ条件を満たしました。次の工程へ進めてください。');
+            } else {
+              commentLines.push('⚠️ quality_score < 80 のため `03.レビュー中` に戻しました。対応後に再実行してください。');
+            }
+
+            await github.issues.createComment({
+              owner,
+              repo,
+              issue_number: issueNumber,
+              body: commentLines.join('\n')
+            });
+
+            if (!passed) {
+              core.setFailed('quality_score below threshold');
+            }
+
+      # ── PR Agent ─────────────────────────────────────────────────────────
+      - name: Ensure dependencies
+        if: ${{ inputs.agent == 'pr' }}
+        run: npm ci
+
+      - name: Create draft PR
+        if: ${{ inputs.agent == 'pr' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const issueNumber = parseInt('${{ inputs.issue_number }}', 10);
+            const branch = 'feat/issue-' + issueNumber;
+            const title = `feat: close #${issueNumber}`;
+
+            try {
+              await github.pulls.create({
+                owner,
+                repo,
+                head: branch,
+                base: '${{ inputs.branch }}',
+                title,
+                body: 'Draft PR generated by PRAgent',
+                draft: true
+              });
+            } catch (error) {
+              if (error.status !== 422) throw error;
+            }
+
+            await github.issues.addLabels({
+              owner,
+              repo,
+              issue_number: issueNumber,
+              labels: ['04.テスト中']
+            });
+
+            await github.issues.createComment({
+              owner,
+              repo,
+              issue_number: issueNumber,
+              body: [
+                '## 📦 PRAgent 実行結果',
+                '',
+                `ドラフトPRを作成しました（branch: feat/issue-${issueNumber}）。レビューを開始してください。`
+              ].join('\n')
+            });
+
+      # ── KPI Collector ────────────────────────────────────────────────────
+      - name: Trigger KPI collection
+        if: ${{ inputs.agent == 'kpi' }}
+        run: node scripts/collect-metrics.js --period=24h
+
+      - name: Comment KPI update
+        if: ${{ inputs.agent == 'kpi' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const issueNumber = parseInt('${{ inputs.issue_number }}', 10);
+            await github.issues.createComment({
+              owner,
+              repo,
+              issue_number: issueNumber,
+              body: '📊 KPIダッシュボードを更新しました。'
+            });
